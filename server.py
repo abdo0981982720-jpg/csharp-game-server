@@ -15,8 +15,13 @@ Python stdlib فقط (http.server + sqlite3 + json + hashlib).
     POST /api/recover  {username, code, new_password} -> {token, username}
            استرجاع كلمة المرور برمز الاسترجاع (بلا بريد — السيرفر المجاني
            لا يرسل SMTP). الرمز يُعطى مرة واحدة عند التسجيل فقط.
+    POST /api/recovery-code           — توليد رمز استرجاع جديد (يتطلب Bearer
+           <token>)، للحسابات التي سُجّلت قبل v1.2.0 ولم تحصل على رمز أبداً.
+           الرمز الجديد يستبدل القديم نهائياً ويُعاد نصه مرة واحدة فقط.
     GET  /api/progress                — يتطلب Authorization: Bearer <token>
-    POST /api/progress {xp, stars, levels_completed, badges[], streak}
+           (يعيد أيضاً level_stars: نجوم كل مستوى {"1": 3, ...})
+    POST /api/progress {xp, stars, levels_completed, badges[], streak, level_stars}
+           يدمج نجوم كل مستوى بالأعلى لكل مستوى على حدة (v1.3.0).
     DELETE /api/account               — حذف الحساب نهائياً (يتطلب Bearer <token>)
     GET  /api/leaderboard?limit=50    — أفضل اللاعبين حسب XP
     GET  /api/daily                   — معرّف تحدي اليوم (نفسه لكل اللاعبين)
@@ -39,7 +44,7 @@ from urllib.parse import urlparse, parse_qs
 DB_PATH = os.environ.get("DB_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "csharp_game.db"))
 PORT = int(os.environ.get("PORT", "8000"))
 HOST = "0.0.0.0"
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 
 USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{3,20}$")
 PBKDF2_ROUNDS = 100_000
@@ -77,9 +82,14 @@ def get_db():
                 levels_completed INTEGER NOT NULL DEFAULT 0,
                 badges TEXT NOT NULL DEFAULT '[]',
                 streak INTEGER NOT NULL DEFAULT 0,
+                level_stars TEXT NOT NULL DEFAULT '{}',
                 updated_at TEXT NOT NULL
             )
         """)
+        # ترحيل آمن للقواعد القديمة (قبل v1.3.0): إضافة عمود نجوم المستويات
+        pcols = [r[1] for r in _db.execute("PRAGMA table_info(progress)").fetchall()]
+        if "level_stars" not in pcols:
+            _db.execute("ALTER TABLE progress ADD COLUMN level_stars TEXT NOT NULL DEFAULT '{}'")
         _db.commit()
     return _db
 
@@ -244,6 +254,28 @@ def dispatch(method, path, query, headers, body_bytes):
                 db.commit()
             return 200, {"ok": True, "token": token, "username": username}
 
+        # توليد رمز استرجاع جديد للمستخدم المسجّل دخوله (v1.3.0):
+        # للحسابات التي سُجّلت قبل v1.2.0 ولم تحصل على رمز أبداً، ولمن
+        # أضاع رمزه. الرمز الجديد يستبدل القديم نهائياً، ويُعاد نصه
+        # الصريح مرة واحدة فقط — يُخزَّن هاشه فقط كالمعتاد.
+        if method == "POST" and path == "/api/recovery-code":
+            token = None
+            auth = headers.get("authorization", "")
+            if auth.lower().startswith("bearer "):
+                token = auth[7:].strip()
+            if not token:
+                return 401, {"error": "missing Authorization: Bearer <token>"}
+            db = get_db()
+            with _db_lock:
+                user = db.execute("SELECT id FROM users WHERE token = ?", (token,)).fetchone()
+                if user is None:
+                    return 401, {"error": "invalid token"}
+                display, code_hash = new_recovery_code()
+                db.execute("UPDATE users SET recovery_code_hash = ? WHERE id = ?",
+                           (code_hash, user["id"]))
+                db.commit()
+            return 200, {"ok": True, "recovery_code": display}
+
         # حذف الحساب نهائياً (موعد به في سياسة الخصوصية):
         # يحذف صف المستخدم + تقدّمه + جلسته، فلا يعود الرمز صالحاً
         # ولا يظهر اللاعب في لوحة الصدارة بعدها.
@@ -282,11 +314,12 @@ def dispatch(method, path, query, headers, body_bytes):
                     row = db.execute("SELECT * FROM progress WHERE user_id = ?", (uid,)).fetchone()
                     if row is None:
                         return 200, {"xp": 0, "stars": 0, "levels_completed": 0,
-                                     "badges": [], "streak": 0}
+                                     "badges": [], "streak": 0, "level_stars": {}}
                     return 200, {"xp": row["xp"], "stars": row["stars"],
                                  "levels_completed": row["levels_completed"],
                                  "badges": json.loads(row["badges"]),
-                                 "streak": row["streak"]}
+                                 "streak": row["streak"],
+                                 "level_stars": _level_stars(row["level_stars"])}
                 if method == "POST":
                     # الدمج: الأعلى دائماً يفوز — لا يُستبدل تقدّم أكبر بأصغر أبداً.
                     row = db.execute("SELECT * FROM progress WHERE user_id = ?", (uid,)).fetchone()
@@ -303,19 +336,29 @@ def dispatch(method, path, query, headers, body_bytes):
                         "streak": max(cur["streak"], _int(body.get("streak"), 0)),
                         "badges": sorted(set(cur["badges"]) | set(_badges(body.get("badges")))),
                     }
+                    # نجوم كل مستوى (v1.3.0): الأعلى يفوز لكل مستوى على حدة.
+                    # حمولة قديمة بلا level_stars تُبقي المخزّن كما هو.
+                    cur_stars = _level_stars(row["level_stars"]) if row is not None else {}
+                    merged_stars = dict(cur_stars)
+                    for key, val in _level_stars(body.get("level_stars")).items():
+                        if val > merged_stars.get(key, 0):
+                            merged_stars[key] = val
                     db.execute(
-                        """INSERT INTO progress (user_id, xp, stars, levels_completed, badges, streak, updated_at)
-                           VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """INSERT INTO progress (user_id, xp, stars, levels_completed, badges, streak, level_stars, updated_at)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                            ON CONFLICT(user_id) DO UPDATE SET
                              xp=excluded.xp, stars=excluded.stars,
                              levels_completed=excluded.levels_completed,
                              badges=excluded.badges, streak=excluded.streak,
+                             level_stars=excluded.level_stars,
                              updated_at=excluded.updated_at""",
                         (uid, merged["xp"], merged["stars"], merged["levels_completed"],
                          json.dumps(merged["badges"], ensure_ascii=False),
-                         merged["streak"], date.today().isoformat()))
+                         merged["streak"],
+                         json.dumps(merged_stars, ensure_ascii=False),
+                         date.today().isoformat()))
                     db.commit()
-                    return 200, {"ok": True, **merged}
+                    return 200, {"ok": True, **merged, "level_stars": merged_stars}
             return 405, {"error": "method not allowed"}
 
         return 404, {"error": "unknown endpoint: %s %s" % (method, path)}
@@ -335,6 +378,28 @@ def _badges(value):
     if isinstance(value, list):
         return [str(b) for b in value if isinstance(b, (str, int))][:50]
     return []
+
+
+def _level_stars(value):
+    """تحويل حقل level_stars (نص JSON أو قاموس) إلى {مستوى: نجوم} نظيف.
+    مفاتيح نصية "1".."100" وقيم 0..3 فقط؛ أي شيء آخر يُتجاهل."""
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except ValueError:
+            return {}
+    if not isinstance(value, dict):
+        return {}
+    out = {}
+    for key, val in value.items():
+        try:
+            level = int(key)
+            stars = int(val)
+        except (TypeError, ValueError):
+            continue
+        if 1 <= level <= 100 and 0 <= stars <= 3:
+            out[str(level)] = stars
+    return out
 
 
 # ---------- خادم HTTP ----------

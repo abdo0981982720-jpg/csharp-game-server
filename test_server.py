@@ -253,7 +253,178 @@ def main():
                                             "new_password": "ab"})
         check("recover with short new password -> 400", s == 400, str(b))
 
-        # 33. الترحيل: قاعدة بيانات قديمة (جدول users بلا عمود رمز الاسترجاع)
+        # 33. توليد رمز استرجاع جديد (v1.3.0): بلا رمز جلسة -> 401
+        s, b = req("POST", "/api/recovery-code", {})
+        check("POST /api/recovery-code without token -> 401", s == 401, str(b))
+
+        # 34. برمز جلسة خاطئ -> 401
+        s, b = req("POST", "/api/recovery-code", {}, token="deadbeef")
+        check("POST /api/recovery-code bad token -> 401", s == 401, str(b))
+
+        # 35. مستخدم مسجّل يولّد رمزاً جديداً بصيغة صحيحة ومختلفاً عن القديم
+        s, b = req("POST", "/api/login", {"username": "layla", "password": "newpass2"})
+        token_layla = b.get("token")
+        check("login layla for regeneration", s == 200 and bool(token_layla), str(b))
+        s, b = req("POST", "/api/recovery-code", {}, token=token_layla)
+        code2 = b.get("recovery_code", "")
+        check("POST /api/recovery-code -> 200 + well-formed new code",
+              s == 200 and bool(_re.match(
+                  r"^[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{4}(-[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{4}){3}$",
+                  code2)) and code2 != code_layla, str(b))
+
+        # 36. الرمز القديم يتوقف عن العمل بعد التوليد الجديد
+        s, b = req("POST", "/api/recover", {"username": "layla", "code": code_layla,
+                                            "new_password": "newpass3"})
+        check("old recovery code dead after regeneration", s == 401, str(b))
+
+        # 37. الرمز الجديد يعمل للاسترجاع
+        s, b = req("POST", "/api/recover", {"username": "layla", "code": code2,
+                                            "new_password": "newpass3"})
+        check("new recovery code works for recover",
+              s == 200 and bool(b.get("token")), str(b))
+        s, b = req("POST", "/api/login", {"username": "layla", "password": "newpass3"})
+        token_layla = b.get("token")
+        check("password after new-code recover works",
+              s == 200 and bool(token_layla), str(b))
+
+        # 38. حساب قديم بلا رمز (حالة ما قبل v1.2.0 — recovery_code_hash فارغ):
+        # التوليد يمنحه رمزاً يعمل للاسترجاع.
+        import sqlite3 as _sqlite3
+        conn3 = _sqlite3.connect(tmpdb)
+        conn3.execute("UPDATE users SET recovery_code_hash = NULL WHERE username = 'layla'")
+        conn3.commit()
+        conn3.close()
+        s, b = req("POST", "/api/recovery-code", {}, token=token_layla)
+        code3 = b.get("recovery_code", "")
+        check("legacy account (NULL code) gets a code",
+              s == 200 and bool(code3), str(b))
+        s, b = req("POST", "/api/recover", {"username": "layla", "code": code3,
+                                            "new_password": "newpass4"})
+        check("legacy account's new code works for recover",
+              s == 200 and bool(b.get("token")), str(b))
+
+        # 39. نجوم المستويات (v1.3.0): POST مع level_stars ثم GET يعيدها
+        s, b = req("POST", "/api/progress", token=token_ahmad,
+                   body={"xp": 150, "level_stars": {"1": 3, "2": 2, "3": 1}})
+        check("POST progress with level_stars -> 200",
+              s == 200 and b.get("level_stars") == {"1": 3, "2": 2, "3": 1}, str(b))
+        s, b = req("GET", "/api/progress", token=token_ahmad)
+        check("GET progress returns level_stars",
+              s == 200 and b.get("level_stars") == {"1": 3, "2": 2, "3": 1}, str(b))
+
+        # 40. الأعلى يفوز لكل مستوى عبر مزامنتين مختلفتين
+        s, b = req("POST", "/api/progress", token=token_ahmad,
+                   body={"level_stars": {"1": 1, "2": 3, "4": 2}})
+        check("second POST merges per-level max",
+              s == 200 and b.get("level_stars") == {"1": 3, "2": 3, "3": 1, "4": 2},
+              str(b))
+        s, b = req("GET", "/api/progress", token=token_ahmad)
+        check("GET confirms per-level max merge",
+              s == 200 and b.get("level_stars") == {"1": 3, "2": 3, "3": 1, "4": 2},
+              str(b))
+
+        # 41. حمولة قديمة بلا level_stars ما زالت تعمل وتُبقي المخزّن
+        s, b = req("POST", "/api/progress", token=token_ahmad, body={"xp": 150})
+        check("legacy POST without level_stars -> 200", s == 200, str(b))
+        s, b = req("GET", "/api/progress", token=token_ahmad)
+        check("legacy POST preserves stored level_stars",
+              s == 200 and b.get("level_stars") == {"1": 3, "2": 3, "3": 1, "4": 2},
+              str(b))
+
+        # 42. لاعب جديد: GET يعيد level_stars فارغاً
+        s, b = req("POST", "/api/register", {"username": "noura", "password": "zxcv"})
+        token_noura = b.get("token")
+        check("register noura -> 201", s == 201 and bool(token_noura), str(b))
+        s, b = req("GET", "/api/progress", token=token_noura)
+        check("fresh user GET level_stars == {}",
+              s == 200 and b.get("level_stars") == {}, str(b))
+
+        # 43. الترحيل: جدول progress قديم بلا عمود level_stars — السيرفر
+        # يضيف العمود تلقائياً ويعمل عليه.
+        import sqlite3 as _s3
+        old3_dir = tempfile.mkdtemp()
+        old3_db = os.path.join(old3_dir, "old3.db")
+        conn3 = _s3.connect(old3_db)
+        conn3.execute("""
+            CREATE TABLE users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT UNIQUE NOT NULL,
+                salt TEXT NOT NULL,
+                password_hash TEXT NOT NULL,
+                token TEXT UNIQUE,
+                created_at TEXT NOT NULL,
+                recovery_code_hash TEXT
+            )
+        """)
+        conn3.execute("""
+            CREATE TABLE progress (
+                user_id INTEGER PRIMARY KEY REFERENCES users(id),
+                xp INTEGER NOT NULL DEFAULT 0,
+                stars INTEGER NOT NULL DEFAULT 0,
+                levels_completed INTEGER NOT NULL DEFAULT 0,
+                badges TEXT NOT NULL DEFAULT '[]',
+                streak INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL
+            )
+        """)
+        conn3.commit()
+        conn3.close()
+        port3 = PORT + 2
+        base3 = "http://127.0.0.1:%d" % port3
+        env3 = dict(os.environ, PORT=str(port3), DB_PATH=old3_db)
+        proc3 = subprocess.Popen([sys.executable, os.path.join(HERE, "server.py")],
+                                 env=env3, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            ok3 = False
+            for _ in range(50):
+                try:
+                    urllib.request.urlopen(base3 + "/api/health", timeout=1)
+                    ok3 = True
+                    break
+                except Exception:
+                    time.sleep(0.1)
+            check("server starts on old progress-table DB", ok3)
+            if ok3:
+                def req3(method, path, body=None, token=None):
+                    data = json.dumps(body).encode("utf-8") if body is not None else None
+                    r = urllib.request.Request(base3 + path, data=data, method=method)
+                    if data is not None:
+                        r.add_header("Content-Type", "application/json")
+                    if token:
+                        r.add_header("Authorization", "Bearer " + token)
+                    try:
+                        with urllib.request.urlopen(r, timeout=5) as resp:
+                            return resp.status, json.loads(resp.read().decode("utf-8"))
+                    except urllib.error.HTTPError as e:
+                        try:
+                            return e.code, json.loads(e.read().decode("utf-8"))
+                        except Exception:
+                            return e.code, {}
+                s3, b3 = req3("POST", "/api/register",
+                              {"username": "migrant2", "password": "1234"})
+                tok3 = b3.get("token")
+                check("register on migrated DB -> 201", s3 == 201 and bool(tok3), str(b3))
+                s3, b3 = req3("POST", "/api/progress", token=tok3,
+                              body={"level_stars": {"1": 2, "5": 3}})
+                check("POST level_stars works after migration",
+                      s3 == 200 and b3.get("level_stars") == {"1": 2, "5": 3}, str(b3))
+                s3, b3 = req3("GET", "/api/progress", token=tok3)
+                check("GET level_stars works after migration",
+                      s3 == 200 and b3.get("level_stars") == {"1": 2, "5": 3}, str(b3))
+                conn3b = _s3.connect(old3_db)
+                pcols3 = [row[1] for row in
+                          conn3b.execute("PRAGMA table_info(progress)").fetchall()]
+                conn3b.close()
+                check("migration added level_stars column",
+                      "level_stars" in pcols3, str(pcols3))
+        finally:
+            proc3.terminate()
+            try:
+                proc3.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc3.kill()
+
+        # 44. الترحيل: قاعدة بيانات قديمة (جدول users بلا عمود رمز الاسترجاع)
         # يجب أن يعمل السيرفر عليها ويضيف العمود تلقائياً.
         import sqlite3
         old_dir = tempfile.mkdtemp()
