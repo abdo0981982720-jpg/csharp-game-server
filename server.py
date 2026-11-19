@@ -19,9 +19,15 @@ Python stdlib فقط (http.server + sqlite3 + json + hashlib).
            <token>)، للحسابات التي سُجّلت قبل v1.2.0 ولم تحصل على رمز أبداً.
            الرمز الجديد يستبدل القديم نهائياً ويُعاد نصه مرة واحدة فقط.
     GET  /api/progress                — يتطلب Authorization: Bearer <token>
-           (يعيد أيضاً level_stars: نجوم كل مستوى {"1": 3, ...})
-    POST /api/progress {xp, stars, levels_completed, badges[], streak, level_stars}
-           يدمج نجوم كل مستوى بالأعلى لكل مستوى على حدة (v1.3.0).
+           (يعيد أيضاً level_stars: نجوم كل مستوى {"1": 3, ...}،
+           وgems: الجواهر، وfeatures: الميزات الدائمة المشتراة)
+    POST /api/progress {xp, stars, levels_completed, badges[], streak, level_stars, gems, features}
+           يدمج نجوم كل مستوى بالأعلى لكل مستوى على حدة (v1.3.0)،
+           والجواهر بالأعلى والميزات بالاتحاد (v1.4.0).
+    POST /api/redeem {code}            — استبدال كود جواهر (يتطلب Bearer
+           <token>). الأكواد موقّعة بـ HMAC بسرّ لا يعرفه إلا صاحب اللعبة
+           (متغير بيئة GEM_CODE_SECRET أو ملف .gem_secret بجانب server.py —
+           لا يُرفع للريبو أبداً)، وكل كود يعمل مرة واحدة فقط.
     DELETE /api/account               — حذف الحساب نهائياً (يتطلب Bearer <token>)
     GET  /api/leaderboard?limit=50    — أفضل اللاعبين حسب XP
     GET  /api/daily                   — معرّف تحدي اليوم (نفسه لكل اللاعبين)
@@ -44,7 +50,7 @@ from urllib.parse import urlparse, parse_qs
 DB_PATH = os.environ.get("DB_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "csharp_game.db"))
 PORT = int(os.environ.get("PORT", "8000"))
 HOST = "0.0.0.0"
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 
 USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{3,20}$")
 PBKDF2_ROUNDS = 100_000
@@ -83,6 +89,8 @@ def get_db():
                 badges TEXT NOT NULL DEFAULT '[]',
                 streak INTEGER NOT NULL DEFAULT 0,
                 level_stars TEXT NOT NULL DEFAULT '{}',
+                gems INTEGER NOT NULL DEFAULT 0,
+                features TEXT NOT NULL DEFAULT '[]',
                 updated_at TEXT NOT NULL
             )
         """)
@@ -90,6 +98,22 @@ def get_db():
         pcols = [r[1] for r in _db.execute("PRAGMA table_info(progress)").fetchall()]
         if "level_stars" not in pcols:
             _db.execute("ALTER TABLE progress ADD COLUMN level_stars TEXT NOT NULL DEFAULT '{}'")
+        # ترحيل آمن للقواعد القديمة (قبل v1.4.0): الجواهر والميزات الدائمة
+        pcols = [r[1] for r in _db.execute("PRAGMA table_info(progress)").fetchall()]
+        if "gems" not in pcols:
+            _db.execute("ALTER TABLE progress ADD COLUMN gems INTEGER NOT NULL DEFAULT 0")
+        if "features" not in pcols:
+            _db.execute("ALTER TABLE progress ADD COLUMN features TEXT NOT NULL DEFAULT '[]'")
+        # أكواد الجواهر المستبدلة (v1.4.0): هاش الكود مفتاح أساسي —
+        # كل كود يعمل مرة واحدة فقط، وهاشه فقط يُخزَّن لا نصه.
+        _db.execute("""
+            CREATE TABLE IF NOT EXISTS redeemed_codes (
+                code_hash TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL REFERENCES users(id),
+                gems INTEGER NOT NULL,
+                redeemed_at TEXT NOT NULL
+            )
+        """)
         _db.commit()
     return _db
 
@@ -139,6 +163,71 @@ def verify_recovery_code(code, stored):
         return False
     salt, expected = stored.split(":", 1)
     return verify_password(normalize_recovery_code(code), salt, expected)
+
+
+# ---------- أكواد الجواهر (v1.4.0) ----------
+# كود موقّع ذاتي التحقق (لا تسجيل مسبق): GEM-<pack>-<RANDOM6>-<TAG6>
+# حيث pack حزمة الجواهر (100/500/1000)، وRANDOM6 ستة أحرف عشوائية
+# من مجموعة بلا أحرف ملتبسة، وTAG6 أول ستة أحرف من
+# HMAC-SHA256(secret, "pack|RANDOM6") محوّلة لمجموعة الأحرف نفسها.
+# السرّ يُقرأ من متغير البيئة GEM_CODE_SECRET أو من ملف .gem_secret
+# بجانب server.py (مُستثناة من git — الريبو عام والسرّ لا يُرفع أبداً).
+# بلا سرّ، يرفض السيرفر كل الأكواد بـ 503 ولا يقبل أي كود أبداً.
+
+GEM_CHARSET = RECOVERY_CHARSET
+GEM_PACKS = (100, 500, 1000)
+GEM_CODE_RE = re.compile(
+    r"^GEM-(100|500|1000)-([ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{6})"
+    r"-([ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{6})$")
+
+# معرّفات الميزات الدائمة المعروفة — أي ميزة غيرها تُتجاهل عند المزامنة
+FEATURE_IDS = frozenset(["extra_heart", "no_timer", "xp2",
+                         "hints_inf", "unlock_all", "gold_theme"])
+
+
+def gem_secret():
+    """السرّ من البيئة أولاً، ثم من ملف .gem_secret، وإلا None."""
+    secret = os.environ.get("GEM_CODE_SECRET", "").strip()
+    if secret:
+        return secret
+    try:
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               ".gem_secret"), "r", encoding="utf-8") as f:
+            secret = f.read().strip()
+            return secret or None
+    except OSError:
+        return None
+
+
+def _gem_tag(secret, pack, rand):
+    """الوسم الموقّع: 6 أحرف مشتقة حتمياً من HMAC-SHA256."""
+    mac = hmac.new(secret.encode("utf-8"),
+                   ("%d|%s" % (pack, rand)).encode("utf-8"),
+                   hashlib.sha256).digest()
+    return "".join(GEM_CHARSET[b % len(GEM_CHARSET)] for b in mac[:6])
+
+
+def new_gem_code(secret, pack):
+    """توليد كود جواهر جديد لحزمة معيّنة (يستخدمه مولّد الأكواد)."""
+    if pack not in GEM_PACKS:
+        raise ValueError("unknown gem pack: %r" % (pack,))
+    rand = "".join(secrets.choice(GEM_CHARSET) for _ in range(6))
+    return "GEM-%d-%s-%s" % (pack, rand, _gem_tag(secret, pack, rand))
+
+
+def verify_gem_code(code, secret):
+    """التحقق من كود: يعيد عدد الجواهر عند الصحة، وNone عند أي خطأ
+    (صيغة خاطئة، حزمة مجهولة، وسم مزوّر)."""
+    if not secret:
+        return None
+    m = GEM_CODE_RE.match(str(code).strip().upper())
+    if not m:
+        return None
+    pack = int(m.group(1))
+    rand, tag = m.group(2), m.group(3)
+    if not hmac.compare_digest(tag, _gem_tag(secret, pack, rand)):
+        return None
+    return pack
 
 
 def daily_id_for(d):
@@ -276,6 +365,54 @@ def dispatch(method, path, query, headers, body_bytes):
                 db.commit()
             return 200, {"ok": True, "recovery_code": display}
 
+        # استبدال كود جواهر (v1.4.0): التحقق من التوقيع أولاً، ثم من أن
+        # الكود لم يُستبدل من قبل (هاشه مفتاح أساسي — استعمال واحد فقط).
+        # كود خاطئ أو مزوّر -> 400، ومستبدل من قبل -> 409، وبلا سرّ مهيأ
+        # على السيرفر -> 503 (لا يُقبل أي كود بلا تحقق أبداً).
+        if method == "POST" and path == "/api/redeem":
+            token = None
+            auth = headers.get("authorization", "")
+            if auth.lower().startswith("bearer "):
+                token = auth[7:].strip()
+            if not token:
+                return 401, {"error": "missing Authorization: Bearer <token>"}
+            secret = gem_secret()
+            if secret is None:
+                return 503, {"error": "gem codes not configured on this server"}
+            code = str(body.get("code", "")).strip().upper()
+            pack = verify_gem_code(code, secret)
+            if pack is None:
+                return 400, {"error": "invalid gem code"}
+            db = get_db()
+            with _db_lock:
+                user = db.execute("SELECT id FROM users WHERE token = ?", (token,)).fetchone()
+                if user is None:
+                    return 401, {"error": "invalid token"}
+                uid = user["id"]
+                code_hash = hashlib.sha256(code.encode("utf-8")).hexdigest()
+                already = db.execute(
+                    "SELECT code_hash FROM redeemed_codes WHERE code_hash = ?",
+                    (code_hash,)).fetchone()
+                if already is not None:
+                    return 409, {"error": "code already redeemed"}
+                today = date.today().isoformat()
+                db.execute(
+                    "INSERT INTO redeemed_codes (code_hash, user_id, gems, redeemed_at)"
+                    " VALUES (?, ?, ?, ?)", (code_hash, uid, pack, today))
+                row = db.execute("SELECT gems FROM progress WHERE user_id = ?",
+                                 (uid,)).fetchone()
+                total = (row["gems"] if row is not None else 0) + pack
+                if row is None:
+                    db.execute(
+                        "INSERT INTO progress (user_id, gems, updated_at)"
+                        " VALUES (?, ?, ?)", (uid, total, today))
+                else:
+                    db.execute(
+                        "UPDATE progress SET gems = ?, updated_at = ? WHERE user_id = ?",
+                        (total, today, uid))
+                db.commit()
+            return 200, {"ok": True, "gems": pack, "total_gems": total}
+
         # حذف الحساب نهائياً (موعد به في سياسة الخصوصية):
         # يحذف صف المستخدم + تقدّمه + جلسته، فلا يعود الرمز صالحاً
         # ولا يظهر اللاعب في لوحة الصدارة بعدها.
@@ -314,20 +451,25 @@ def dispatch(method, path, query, headers, body_bytes):
                     row = db.execute("SELECT * FROM progress WHERE user_id = ?", (uid,)).fetchone()
                     if row is None:
                         return 200, {"xp": 0, "stars": 0, "levels_completed": 0,
-                                     "badges": [], "streak": 0, "level_stars": {}}
+                                     "badges": [], "streak": 0, "level_stars": {},
+                                     "gems": 0, "features": []}
                     return 200, {"xp": row["xp"], "stars": row["stars"],
                                  "levels_completed": row["levels_completed"],
                                  "badges": json.loads(row["badges"]),
                                  "streak": row["streak"],
-                                 "level_stars": _level_stars(row["level_stars"])}
+                                 "level_stars": _level_stars(row["level_stars"]),
+                                 "gems": row["gems"],
+                                 "features": _features(row["features"])}
                 if method == "POST":
                     # الدمج: الأعلى دائماً يفوز — لا يُستبدل تقدّم أكبر بأصغر أبداً.
                     row = db.execute("SELECT * FROM progress WHERE user_id = ?", (uid,)).fetchone()
                     cur = {"xp": 0, "stars": 0, "levels_completed": 0,
-                           "badges": [], "streak": 0} if row is None else {
+                           "badges": [], "streak": 0, "gems": 0, "features": []} \
+                        if row is None else {
                         "xp": row["xp"], "stars": row["stars"],
                         "levels_completed": row["levels_completed"],
-                        "badges": json.loads(row["badges"]), "streak": row["streak"]}
+                        "badges": json.loads(row["badges"]), "streak": row["streak"],
+                        "gems": row["gems"], "features": _features(row["features"])}
                     merged = {
                         "xp": max(cur["xp"], _int(body.get("xp"), 0)),
                         "stars": max(cur["stars"], _int(body.get("stars"), 0)),
@@ -335,6 +477,13 @@ def dispatch(method, path, query, headers, body_bytes):
                                                 _int(body.get("levels_completed"), 0)),
                         "streak": max(cur["streak"], _int(body.get("streak"), 0)),
                         "badges": sorted(set(cur["badges"]) | set(_badges(body.get("badges")))),
+                        # الجواهر (v1.4.0): الأعلى يفوز مثل XP — لم تعد
+                        # تُتجاهل كما قبل، فيبقى رصيد اللاعب بعد إعادة التثبيت.
+                        "gems": max(cur["gems"], _int(body.get("gems"), 0)),
+                        # الميزات الدائمة (v1.4.0): اتحاد مثل الأوسمة —
+                        # مشتريات اللاعب لا تضيع أبداً.
+                        "features": sorted(set(cur["features"])
+                                           | set(_features(body.get("features")))),
                     }
                     # نجوم كل مستوى (v1.3.0): الأعلى يفوز لكل مستوى على حدة.
                     # حمولة قديمة بلا level_stars تُبقي المخزّن كما هو.
@@ -344,18 +493,21 @@ def dispatch(method, path, query, headers, body_bytes):
                         if val > merged_stars.get(key, 0):
                             merged_stars[key] = val
                     db.execute(
-                        """INSERT INTO progress (user_id, xp, stars, levels_completed, badges, streak, level_stars, updated_at)
-                           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """INSERT INTO progress (user_id, xp, stars, levels_completed, badges, streak, level_stars, gems, features, updated_at)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                            ON CONFLICT(user_id) DO UPDATE SET
                              xp=excluded.xp, stars=excluded.stars,
                              levels_completed=excluded.levels_completed,
                              badges=excluded.badges, streak=excluded.streak,
                              level_stars=excluded.level_stars,
+                             gems=excluded.gems, features=excluded.features,
                              updated_at=excluded.updated_at""",
                         (uid, merged["xp"], merged["stars"], merged["levels_completed"],
                          json.dumps(merged["badges"], ensure_ascii=False),
                          merged["streak"],
                          json.dumps(merged_stars, ensure_ascii=False),
+                         merged["gems"],
+                         json.dumps(merged["features"], ensure_ascii=False),
                          date.today().isoformat()))
                     db.commit()
                     return 200, {"ok": True, **merged, "level_stars": merged_stars}
@@ -378,6 +530,19 @@ def _badges(value):
     if isinstance(value, list):
         return [str(b) for b in value if isinstance(b, (str, int))][:50]
     return []
+
+
+def _features(value):
+    """تحويل حقل features (نص JSON أو قائمة) إلى قائمة معرّفات معروفة فقط.
+    أي معرّف غير معروف يُتجاهل — لا يدخل قاعدة البيانات إلا ما تبيعه اللعبة."""
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except ValueError:
+            return []
+    if not isinstance(value, list):
+        return []
+    return [str(f) for f in value if isinstance(f, str) and f in FEATURE_IDS][:10]
 
 
 def _level_stars(value):

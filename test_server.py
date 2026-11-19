@@ -4,6 +4,7 @@
 ثم يضرب كل نقطة اتصال ويتحقق من النتائج. التشغيل: python3 test_server.py"""
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -12,8 +13,12 @@ import urllib.request
 import urllib.error
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+import server as server_mod  # لتوليد أكواد جواهر صالحة في الاختبارات
+
 PORT = 18099
 BASE = "http://127.0.0.1:%d" % PORT
+TEST_GEM_SECRET = "test-gem-secret-1234567890abcdef"
 
 passed = failed = 0
 
@@ -47,7 +52,8 @@ def req(method, path, body=None, token=None):
 
 def main():
     tmpdb = os.path.join(tempfile.mkdtemp(), "test.db")
-    env = dict(os.environ, PORT=str(PORT), DB_PATH=tmpdb)
+    env = dict(os.environ, PORT=str(PORT), DB_PATH=tmpdb,
+               GEM_CODE_SECRET=TEST_GEM_SECRET)
     proc = subprocess.Popen([sys.executable, os.path.join(HERE, "server.py")],
                             env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
@@ -411,12 +417,24 @@ def main():
                 s3, b3 = req3("GET", "/api/progress", token=tok3)
                 check("GET level_stars works after migration",
                       s3 == 200 and b3.get("level_stars") == {"1": 2, "5": 3}, str(b3))
+                # v1.4.0: الترحيل نفسه يضيف عمودي الجواهر والميزات أيضاً
+                s3, b3 = req3("POST", "/api/progress", token=tok3,
+                              body={"gems": 40, "features": ["xp2", "bogus_feature"]})
+                check("POST gems+features works after migration",
+                      s3 == 200 and b3.get("gems") == 40
+                      and b3.get("features") == ["xp2"], str(b3))
+                s3, b3 = req3("GET", "/api/progress", token=tok3)
+                check("GET gems+features works after migration",
+                      s3 == 200 and b3.get("gems") == 40
+                      and b3.get("features") == ["xp2"], str(b3))
                 conn3b = _s3.connect(old3_db)
                 pcols3 = [row[1] for row in
                           conn3b.execute("PRAGMA table_info(progress)").fetchall()]
                 conn3b.close()
                 check("migration added level_stars column",
                       "level_stars" in pcols3, str(pcols3))
+                check("migration added gems+features columns",
+                      "gems" in pcols3 and "features" in pcols3, str(pcols3))
         finally:
             proc3.terminate()
             try:
@@ -481,6 +499,139 @@ def main():
                 proc2.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 proc2.kill()
+
+        # 45. أكواد الجواهر (v1.4.0): استبدال بلا رمز جلسة -> 401
+        code500 = server_mod.new_gem_code(TEST_GEM_SECRET, 500)
+        check("generated gem code format GEM-500-XXXXXX-XXXXXX",
+              bool(re.match(r"^GEM-500-[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{6}"
+                            r"-[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{6}$", code500)),
+              code500)
+        s, b = req("POST", "/api/redeem", {"code": code500})
+        check("POST /api/redeem without token -> 401", s == 401, str(b))
+        s, b = req("POST", "/api/redeem", {"code": code500}, token="deadbeef")
+        check("POST /api/redeem bad token -> 401", s == 401, str(b))
+
+        # 46. كود بصيغة خاطئة -> 400
+        s, b = req("POST", "/api/redeem", {"code": "NOT-A-CODE"}, token=token_ahmad)
+        check("redeem malformed code -> 400", s == 400, str(b))
+        s, b = req("POST", "/api/redeem", {"code": ""}, token=token_ahmad)
+        check("redeem empty code -> 400", s == 400, str(b))
+
+        # 47. حزمة مجهولة -> 400
+        s, b = req("POST", "/api/redeem",
+                   {"code": "GEM-200-ABCDEF-GHJKLM"}, token=token_ahmad)
+        check("redeem unknown pack -> 400", s == 400, str(b))
+
+        # 48. وسم مزوّر (آخر حرف مبدّل) -> 400
+        tampered = code500[:-1] + ("A" if code500[-1] != "A" else "B")
+        s, b = req("POST", "/api/redeem", {"code": tampered}, token=token_ahmad)
+        check("redeem tampered tag -> 400", s == 400, str(b))
+
+        # 49. كود صحيح: يمنح الجواهر مرة واحدة، ويظهر في GET /api/progress
+        s, b = req("POST", "/api/redeem", {"code": code500}, token=token_ahmad)
+        check("redeem valid 500 code -> 200 + gems 500",
+              s == 200 and b.get("gems") == 500 and b.get("total_gems") == 500,
+              str(b))
+        s, b = req("GET", "/api/progress", token=token_ahmad)
+        check("GET progress shows redeemed gems 500",
+              s == 200 and b.get("gems") == 500, str(b))
+
+        # 50. الكود نفسه مرة ثانية -> 409، والرصيد لا يتغير
+        s, b = req("POST", "/api/redeem", {"code": code500}, token=token_ahmad)
+        check("redeem same code twice -> 409", s == 409, str(b))
+        s, b = req("POST", "/api/redeem", {"code": code500}, token=token_sara)
+        check("redeemed code dead for other players too -> 409", s == 409, str(b))
+        s, b = req("GET", "/api/progress", token=token_ahmad)
+        check("gems unchanged after double redeem",
+              s == 200 and b.get("gems") == 500, str(b))
+
+        # 51. كود ثانٍ (100) يتراكم على الرصيد؛ والكود يُقبل بأحرف صغيرة
+        code100 = server_mod.new_gem_code(TEST_GEM_SECRET, 100)
+        s, b = req("POST", "/api/redeem", {"code": code100.lower()},
+                   token=token_ahmad)
+        check("redeem valid 100 code (lowercase ok) -> total 600",
+              s == 200 and b.get("gems") == 100 and b.get("total_gems") == 600,
+              str(b))
+
+        # 52. دمج الجواهر في POST /api/progress: الأعلى يفوز
+        s, b = req("POST", "/api/progress", token=token_ahmad, body={"gems": 50})
+        check("lower gems post keeps max 600",
+              s == 200 and b.get("gems") == 600, str(b))
+        s, b = req("POST", "/api/progress", token=token_ahmad, body={"gems": 700})
+        check("higher gems post wins 700",
+              s == 200 and b.get("gems") == 700, str(b))
+
+        # 53. الميزات الدائمة: اتحاد عبر مزامنتين، وغير المعروفة تُتجاهل
+        s, b = req("POST", "/api/progress", token=token_ahmad,
+                   body={"features": ["extra_heart", "no_such_feature"]})
+        check("POST features stores known ids only",
+              s == 200 and b.get("features") == ["extra_heart"], str(b))
+        s, b = req("POST", "/api/progress", token=token_ahmad,
+                   body={"features": ["gold_theme"]})
+        check("features union across two syncs",
+              s == 200 and b.get("features") == ["extra_heart", "gold_theme"],
+              str(b))
+        s, b = req("GET", "/api/progress", token=token_ahmad)
+        check("GET progress returns features union",
+              s == 200 and b.get("features") == ["extra_heart", "gold_theme"],
+              str(b))
+        s, b = req("POST", "/api/progress", token=token_ahmad,
+                   body={"features": []})
+        check("empty features post keeps stored features",
+              s == 200 and b.get("features") == ["extra_heart", "gold_theme"],
+              str(b))
+
+        # 54. سيرفر بلا سرّ أكواد: /api/redeem يرد 503 ولا يقبل أي كود
+        nosecret_dir = tempfile.mkdtemp()
+        nosecret_db = os.path.join(nosecret_dir, "nosecret.db")
+        port4 = PORT + 3
+        base4 = "http://127.0.0.1:%d" % port4
+        env4 = dict(os.environ, PORT=str(port4), DB_PATH=nosecret_db)
+        env4.pop("GEM_CODE_SECRET", None)
+        proc4 = subprocess.Popen([sys.executable, os.path.join(HERE, "server.py")],
+                                 env=env4, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL)
+        try:
+            ok4 = False
+            for _ in range(50):
+                try:
+                    urllib.request.urlopen(base4 + "/api/health", timeout=1)
+                    ok4 = True
+                    break
+                except Exception:
+                    time.sleep(0.1)
+            check("no-secret server starts", ok4)
+            if ok4:
+                def req4(method, path, body=None, token=None):
+                    data = json.dumps(body).encode("utf-8") if body is not None else None
+                    r = urllib.request.Request(base4 + path, data=data, method=method)
+                    if data is not None:
+                        r.add_header("Content-Type", "application/json")
+                    if token:
+                        r.add_header("Authorization", "Bearer " + token)
+                    try:
+                        with urllib.request.urlopen(r, timeout=5) as resp:
+                            return resp.status, json.loads(resp.read().decode("utf-8"))
+                    except urllib.error.HTTPError as e:
+                        try:
+                            return e.code, json.loads(e.read().decode("utf-8"))
+                        except Exception:
+                            return e.code, {}
+                s4, b4 = req4("POST", "/api/register",
+                              {"username": "nosec", "password": "1234"})
+                tok4 = b4.get("token")
+                check("register on no-secret server -> 201",
+                      s4 == 201 and bool(tok4), str(b4))
+                code4 = server_mod.new_gem_code(TEST_GEM_SECRET, 1000)
+                s4, b4 = req4("POST", "/api/redeem", {"code": code4}, token=tok4)
+                check("redeem on no-secret server -> 503",
+                      s4 == 503, str(b4))
+        finally:
+            proc4.terminate()
+            try:
+                proc4.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc4.kill()
 
         print("\n%d passed, %d failed" % (passed, failed))
         return 0 if failed == 0 else 1
