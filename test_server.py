@@ -209,6 +209,108 @@ def main():
         s, b = req("GET", "/api/health")
         check("health players == 2 after deletion", s == 200 and b.get("players") == 2, str(b))
 
+        # 27. التسجيل يعيد رمز استرجاع بصيغة صحيحة (4 مجموعات × 4 أحرف)
+        s, b = req("POST", "/api/register", {"username": "layla", "password": "qwer"})
+        code_layla = b.get("recovery_code", "")
+        import re as _re
+        check("register returns recovery code XXXX-XXXX-XXXX-XXXX",
+              s == 201 and bool(_re.match(
+                  r"^[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{4}(-[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{4}){3}$",
+                  code_layla)), str(b))
+
+        # 28. استرجاع برمز خاطئ -> 401
+        s, b = req("POST", "/api/recover", {"username": "layla", "code": "AAAA-BBBB-CCCC-DDDD",
+                                            "new_password": "newp"})
+        check("recover with wrong code -> 401", s == 401, str(b))
+
+        # 29. استرجاع لمستخدم غير موجود -> 401 (نفس الخطأ — لا يُكشف وجود الحساب)
+        s, b = req("POST", "/api/recover", {"username": "ghost", "code": code_layla,
+                                            "new_password": "newp"})
+        check("recover unknown user -> 401", s == 401, str(b))
+
+        # 30. استرجاع صحيح -> 200 + رمز جلسة؛ كلمة المرور القديمة تتوقف
+        s, b = req("POST", "/api/recover", {"username": "layla", "code": code_layla,
+                                            "new_password": "newpass1"})
+        token_layla = b.get("token")
+        check("recover with correct code -> 200 + token",
+              s == 200 and bool(token_layla), str(b))
+        s, b = req("POST", "/api/login", {"username": "layla", "password": "qwer"})
+        check("old password stops working after recover", s == 401, str(b))
+        s, b = req("POST", "/api/login", {"username": "layla", "password": "newpass1"})
+        check("new password works after recover", s == 200 and bool(b.get("token")), str(b))
+
+        # 31. الرمز لا يتغيّر بعد الاستخدام، ويُقبل بلا شرطات وبحروف صغيرة
+        plain = code_layla.replace("-", "").lower()
+        s, b = req("POST", "/api/recover", {"username": "layla", "code": plain,
+                                            "new_password": "newpass2"})
+        check("same code reusable, dashes/case-insensitive",
+              s == 200 and bool(b.get("token")), str(b))
+        s, b = req("POST", "/api/login", {"username": "layla", "password": "newpass2"})
+        check("second recovered password works", s == 200 and bool(b.get("token")), str(b))
+
+        # 32. كلمة مرور جديدة قصيرة -> 400
+        s, b = req("POST", "/api/recover", {"username": "layla", "code": code_layla,
+                                            "new_password": "ab"})
+        check("recover with short new password -> 400", s == 400, str(b))
+
+        # 33. الترحيل: قاعدة بيانات قديمة (جدول users بلا عمود رمز الاسترجاع)
+        # يجب أن يعمل السيرفر عليها ويضيف العمود تلقائياً.
+        import sqlite3
+        old_dir = tempfile.mkdtemp()
+        old_db = os.path.join(old_dir, "old.db")
+        conn = sqlite3.connect(old_db)
+        conn.execute("""
+            CREATE TABLE users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT UNIQUE NOT NULL,
+                salt TEXT NOT NULL,
+                password_hash TEXT NOT NULL,
+                token TEXT UNIQUE,
+                created_at TEXT NOT NULL
+            )
+        """)
+        conn.commit()
+        conn.close()
+        port2 = PORT + 1
+        base2 = "http://127.0.0.1:%d" % port2
+        env2 = dict(os.environ, PORT=str(port2), DB_PATH=old_db)
+        proc2 = subprocess.Popen([sys.executable, os.path.join(HERE, "server.py")],
+                                 env=env2, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            ok_start = False
+            for _ in range(50):
+                try:
+                    urllib.request.urlopen(base2 + "/api/health", timeout=1)
+                    ok_start = True
+                    break
+                except Exception:
+                    time.sleep(0.1)
+            check("server starts on old-schema DB", ok_start)
+            if ok_start:
+                data = json.dumps({"username": "migrant", "password": "1234"}).encode("utf-8")
+                r = urllib.request.Request(base2 + "/api/register", data=data, method="POST")
+                r.add_header("Content-Type", "application/json")
+                try:
+                    with urllib.request.urlopen(r, timeout=5) as resp:
+                        rb = json.loads(resp.read().decode("utf-8"))
+                        check("register works after migration, returns recovery code",
+                              resp.status == 201 and bool(rb.get("recovery_code")), str(rb))
+                except urllib.error.HTTPError as e:
+                    check("register works after migration, returns recovery code",
+                          False, "HTTP %d" % e.code)
+                conn2 = sqlite3.connect(old_db)
+                cols = [row[1] for row in
+                        conn2.execute("PRAGMA table_info(users)").fetchall()]
+                conn2.close()
+                check("migration added recovery_code_hash column",
+                      "recovery_code_hash" in cols, str(cols))
+        finally:
+            proc2.terminate()
+            try:
+                proc2.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc2.kill()
+
         print("\n%d passed, %d failed" % (passed, failed))
         return 0 if failed == 0 else 1
     finally:

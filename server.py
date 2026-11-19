@@ -10,8 +10,11 @@ Python stdlib فقط (http.server + sqlite3 + json + hashlib).
 
 نقاط الاتصال (كلها JSON):
     GET  /api/health                  — فحص السيرفر
-    POST /api/register {username, password} -> {token, username}
+    POST /api/register {username, password} -> {token, username, recovery_code}
     POST /api/login    {username, password} -> {token, username}
+    POST /api/recover  {username, code, new_password} -> {token, username}
+           استرجاع كلمة المرور برمز الاسترجاع (بلا بريد — السيرفر المجاني
+           لا يرسل SMTP). الرمز يُعطى مرة واحدة عند التسجيل فقط.
     GET  /api/progress                — يتطلب Authorization: Bearer <token>
     POST /api/progress {xp, stars, levels_completed, badges[], streak}
     DELETE /api/account               — حذف الحساب نهائياً (يتطلب Bearer <token>)
@@ -36,7 +39,7 @@ from urllib.parse import urlparse, parse_qs
 DB_PATH = os.environ.get("DB_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "csharp_game.db"))
 PORT = int(os.environ.get("PORT", "8000"))
 HOST = "0.0.0.0"
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{3,20}$")
 PBKDF2_ROUNDS = 100_000
@@ -58,9 +61,14 @@ def get_db():
                 salt TEXT NOT NULL,
                 password_hash TEXT NOT NULL,
                 token TEXT UNIQUE,
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                recovery_code_hash TEXT
             )
         """)
+        # ترحيل آمن للقواعد القديمة (قبل v1.2.0): إضافة عمود رمز الاسترجاع
+        cols = [r[1] for r in _db.execute("PRAGMA table_info(users)").fetchall()]
+        if "recovery_code_hash" not in cols:
+            _db.execute("ALTER TABLE users ADD COLUMN recovery_code_hash TEXT")
         _db.execute("""
             CREATE TABLE IF NOT EXISTS progress (
                 user_id INTEGER PRIMARY KEY REFERENCES users(id),
@@ -92,6 +100,35 @@ def verify_password(password, salt, expected_hex):
 
 def new_token():
     return secrets.token_hex(32)
+
+
+# ---------- رمز استرجاع كلمة المرور (v1.2.0) ----------
+# 16 حرفاً من مجموعة بلا أحرف ملتبسة (لا 0/O ولا 1/I/L)، تُعرض
+# بأربع مجموعات مفصولة بشرطات: XXXX-XXXX-XXXX-XXXX. يُخزَّن هاشه
+# فقط (PBKDF2 مع ملح خاص به بصيغة "salt:hash")، ويُعطى النص الصريح
+# للاعب مرة واحدة عند التسجيل — ولا يتغير عند استخدامه.
+
+RECOVERY_CHARSET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+
+
+def new_recovery_code():
+    """يعيد (الرمز للعرض بشرطات، الهاش للتخزين)."""
+    raw = "".join(secrets.choice(RECOVERY_CHARSET) for _ in range(16))
+    display = "-".join(raw[i:i + 4] for i in range(0, 16, 4))
+    salt, digest = hash_password(raw)
+    return display, salt + ":" + digest
+
+
+def normalize_recovery_code(code):
+    """يقبل الرمز بشرطات أو بدونها وبأي حالة أحرف."""
+    return "".join(ch for ch in str(code).upper() if ch.isalnum())
+
+
+def verify_recovery_code(code, stored):
+    if not stored or ":" not in stored:
+        return False
+    salt, expected = stored.split(":", 1)
+    return verify_password(normalize_recovery_code(code), salt, expected)
 
 
 def daily_id_for(d):
@@ -157,16 +194,19 @@ def dispatch(method, path, query, headers, body_bytes):
                         return 409, {"error": "username already taken"}
                     salt, pw_hash = hash_password(password)
                     token = new_token()
+                    recovery_display, recovery_hash = new_recovery_code()
                     today = date.today().isoformat()
                     cur = db.execute(
-                        "INSERT INTO users (username, salt, password_hash, token, created_at)"
-                        " VALUES (?, ?, ?, ?, ?)",
-                        (username, salt, pw_hash, token, today))
+                        "INSERT INTO users (username, salt, password_hash, token, created_at,"
+                        " recovery_code_hash)"
+                        " VALUES (?, ?, ?, ?, ?, ?)",
+                        (username, salt, pw_hash, token, today, recovery_hash))
                     db.execute(
                         "INSERT INTO progress (user_id, updated_at) VALUES (?, ?)",
                         (cur.lastrowid, today))
                     db.commit()
-                return 201, {"ok": True, "token": token, "username": username}
+                return 201, {"ok": True, "token": token, "username": username,
+                             "recovery_code": recovery_display}
 
             # login
             with _db_lock:
@@ -176,6 +216,31 @@ def dispatch(method, path, query, headers, body_bytes):
                     return 401, {"error": "wrong username or password"}
                 token = new_token()
                 db.execute("UPDATE users SET token = ? WHERE id = ?", (token, row["id"]))
+                db.commit()
+            return 200, {"ok": True, "token": token, "username": username}
+
+        # استرجاع كلمة المرور برمز الاسترجاع (v1.2.0): لا بريد إلكتروني.
+        # يُعاد الخطأ نفسه للمستخدم المجهول والرمز الخاطئ حتى لا يُكشف
+        # وجود الحساب. الرمز لا يتغيّر بعد الاستخدام — يبقى صالحاً دائماً.
+        if method == "POST" and path == "/api/recover":
+            username = str(body.get("username", "")).strip()
+            code = str(body.get("code", ""))
+            new_password = str(body.get("new_password", ""))
+            if not USERNAME_RE.match(username):
+                return 400, {"error": "username must be 3-20 letters, digits or _"}
+            if len(new_password) < 4:
+                return 400, {"error": "password must be at least 4 characters"}
+            db = get_db()
+            with _db_lock:
+                row = db.execute("SELECT * FROM users WHERE username = ?",
+                                 (username,)).fetchone()
+                if row is None or not verify_recovery_code(
+                        code, row["recovery_code_hash"]):
+                    return 401, {"error": "wrong username or recovery code"}
+                salt, pw_hash = hash_password(new_password)
+                token = new_token()
+                db.execute("UPDATE users SET salt = ?, password_hash = ?, token = ?"
+                           " WHERE id = ?", (salt, pw_hash, token, row["id"]))
                 db.commit()
             return 200, {"ok": True, "token": token, "username": username}
 
